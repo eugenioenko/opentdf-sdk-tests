@@ -1,0 +1,331 @@
+name: configure-sdks
+description: Check out and build one or more SDK and its CLI tool for use by xtest
+inputs:
+  path:
+    description: The path to check out the SDK source code to; concatenated with branch or tag name.
+  sdk:
+    description: The SDK to configure; one of go, java, js
+  version-info:
+    description: JSON-encoded output of otdf-sdk-mgr versions resolve
+    required: true
+  platform-otdfctl-dir:
+    description: >-
+      Absolute path to platform's otdfctl/ directory. When set and a resolved
+      go version's SHA matches platform-otdfctl-sha the directory is reused
+      via symlink instead of a fresh checkout.
+  platform-otdfctl-sha:
+    description: >-
+      SHA of the commit that platform-otdfctl-dir was checked out at.
+outputs:
+  version-a:
+    description: "Object containing tag, sha, and name of a version checked out"
+    value: ${{ steps.resolve.outputs.version-a }}
+  version-b:
+    description: "Object containing tag, sha, and name of a version checked out, if two or more were specified"
+    value: ${{ steps.resolve.outputs.version-b }}
+  version-c:
+    description: "Object containing tag, sha, and name of a version checked out, if three or more were specified"
+    value: ${{ steps.resolve.outputs.version-c }}
+  version-d:
+    description: "Object containing tag, sha, and name of a version checked out, if four were specified"
+    value: ${{ steps.resolve.outputs.version-d }}
+  heads:
+    description: "JSON list of tags that represent main or branch heads"
+    value: ${{ steps.resolve.outputs.heads }}
+
+runs:
+  using: composite
+  steps:
+    - name: identify repo urls
+      shell: bash
+      run: |
+        # Go source builds always come from opentdf/platform (otdfctl moved
+        # there at v0.31.0); pre-v0.31.0 tags are artifact-install-only via
+        # the Go module proxy and never reach the source-checkout path here.
+        case "$INPUT_SDK" in
+          "go") ;;
+          "java") echo "STANDALONE_REPO=opentdf/java-sdk" >> "$GITHUB_ENV" ;;
+          "js")   echo "STANDALONE_REPO=opentdf/web-sdk" >> "$GITHUB_ENV" ;;
+          *)
+            echo "Invalid SDK specified: $INPUT_SDK" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+            ;;
+        esac
+        echo "PLATFORM_REPO=opentdf/platform" >> "$GITHUB_ENV"
+      env:
+        INPUT_SDK: ${{ inputs.sdk }}
+
+    - name: resolve versions
+      id: resolve
+      shell: bash
+      run: |
+        if [[ $(echo "$version_info" | jq 'length') -gt 4 ]]; then
+          echo "Error: Too many versions resolved in version_info: $(echo "$version_info" | jq 'length')" >> $GITHUB_STEP_SUMMARY
+          exit 1
+        fi
+
+        if echo "$version_info" | jq -e '.[] | select(.err != null)' > /dev/null; then
+          echo "Error: One or more errors occurred while resolving versions for $INPUT_SDK: $version_info"
+          exit 1
+        fi
+        echo "Version Info for $INPUT_SDK: $version_info"
+
+        version_a=$(echo "$version_info" | jq -rc '.[0] // empty')
+        version_b=$(echo "$version_info" | jq -rc '.[1] // empty')
+        version_c=$(echo "$version_info" | jq -rc '.[2] // empty')
+        version_d=$(echo "$version_info" | jq -rc '.[3] // empty')
+        echo "version-a=$version_a" >> $GITHUB_OUTPUT
+        echo "version-b=$version_b" >> $GITHUB_OUTPUT
+        echo "version-c=$version_c" >> $GITHUB_OUTPUT
+        echo "version-d=$version_d" >> $GITHUB_OUTPUT
+        head_tags=$(echo "$version_info" | jq -c '[.[] | select(.head == true) | .tag]')
+        echo "head_tags=$head_tags"
+        echo "heads=$head_tags" >> $GITHUB_OUTPUT
+      env:
+        version_info: ${{ inputs.version-info }}
+        INPUT_SDK: ${{ inputs.sdk }}
+
+    - name: install released versions
+      shell: bash
+      run: |
+        SDK_MGR_DIR="$(cd "$INPUT_PATH/../.." && pwd)/otdf-sdk-mgr"
+        echo "${version_info}" | jq -c '.[]' | while IFS= read -r row; do
+          tag=$(echo "$row" | jq -r '.tag')
+          head=$(echo "$row" | jq -r '.head // false')
+          release=$(echo "$row" | jq -r '.release // empty')
+          if [[ "$head" != "true" && -n "$release" ]]; then
+            echo "Installing $INPUT_SDK $tag from registry (release: $release)"
+            tag_sanitized="${tag//[^a-zA-Z0-9_]/_}"
+            if ! uv run --project "$SDK_MGR_DIR" otdf-sdk-mgr install artifact \
+              --sdk "$INPUT_SDK" --version "$release" --dist-name "$tag"; then
+              echo "  Warning: Artifact installation failed for $INPUT_SDK $tag; falling back to source"
+              echo "BUILD_FROM_SOURCE_${tag_sanitized}=true" >> "$GITHUB_ENV"
+            fi
+          fi
+        done
+      env:
+        version_info: ${{ inputs.version-info }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SDK: ${{ inputs.sdk }}
+
+    - name: determine source checkout needs
+      id: check-source
+      shell: bash
+      run: |
+        # A slot needs checkout if it is a head version OR if artifact install
+        # failed. For go, the only source path is opentdf/platform's otdfctl/
+        # subtree — reuse the existing platform checkout when the SHAs match,
+        # otherwise check out a fresh one.
+        for slot in a b c d; do
+          case "$slot" in
+            a) row=$(echo "${version_info}" | jq -rc '.[0] // empty') ;;
+            b) row=$(echo "${version_info}" | jq -rc '.[1] // empty') ;;
+            c) row=$(echo "${version_info}" | jq -rc '.[2] // empty') ;;
+            d) row=$(echo "${version_info}" | jq -rc '.[3] // empty') ;;
+          esac
+          if [[ -z "$row" ]]; then
+            echo "needs-checkout-${slot}=false" >> "$GITHUB_OUTPUT"
+            echo "is-platform-${slot}=false" >> "$GITHUB_OUTPUT"
+            echo "use-existing-platform-dir-${slot}=false" >> "$GITHUB_OUTPUT"
+            echo "checkout-repo-${slot}=" >> "$GITHUB_OUTPUT"
+            echo "checkout-path-${slot}=" >> "$GITHUB_OUTPUT"
+            continue
+          fi
+
+          tag=$(echo "$row" | jq -r '.tag')
+          head=$(echo "$row" | jq -r '.head // false')
+          sha=$(echo "$row" | jq -r '.sha')
+          tag_sanitized="${tag//[^a-zA-Z0-9_]/_}"
+          build_from_source_var="BUILD_FROM_SOURCE_${tag_sanitized}"
+          needs_source=false
+          if [[ "$head" == "true" || "${!build_from_source_var}" == "true" ]]; then
+            needs_source=true
+          fi
+
+          is_platform=false
+          use_existing=false
+          checkout_repo="${STANDALONE_REPO:-}"
+          checkout_path="${INPUT_PATH}/${INPUT_SDK}/src/${tag}"
+
+          if [[ "$INPUT_SDK" == "go" && "$needs_source" == "true" ]]; then
+            is_platform=true
+            if [[ -n "$PLATFORM_OTDFCTL_DIR" && -n "$PLATFORM_OTDFCTL_SHA" \
+                  && "$sha" == "$PLATFORM_OTDFCTL_SHA" ]]; then
+              use_existing=true
+              needs_source=false
+            else
+              checkout_repo="$PLATFORM_REPO"
+              checkout_path="${INPUT_PATH}/${INPUT_SDK}/platform-src/${tag}"
+            fi
+          fi
+
+          echo "needs-checkout-${slot}=${needs_source}" >> "$GITHUB_OUTPUT"
+          echo "is-platform-${slot}=${is_platform}" >> "$GITHUB_OUTPUT"
+          echo "use-existing-platform-dir-${slot}=${use_existing}" >> "$GITHUB_OUTPUT"
+          echo "checkout-repo-${slot}=${checkout_repo}" >> "$GITHUB_OUTPUT"
+          echo "checkout-path-${slot}=${checkout_path}" >> "$GITHUB_OUTPUT"
+        done
+      env:
+        version_info: ${{ inputs.version-info }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SDK: ${{ inputs.sdk }}
+        PLATFORM_OTDFCTL_DIR: ${{ inputs.platform-otdfctl-dir }}
+        PLATFORM_OTDFCTL_SHA: ${{ inputs.platform-otdfctl-sha }}
+
+    - name: symlink existing platform checkout
+      shell: bash
+      run: |
+        # For versions that can reuse the already-checked-out platform dir,
+        # symlink platform-otdfctl-dir into sdk/go/src/{tag}.
+        for slot in a b c d; do
+          case "$slot" in
+            a) version_json="$VERSION_A" ; use_existing="$USE_EXISTING_A" ;;
+            b) version_json="$VERSION_B" ; use_existing="$USE_EXISTING_B" ;;
+            c) version_json="$VERSION_C" ; use_existing="$USE_EXISTING_C" ;;
+            d) version_json="$VERSION_D" ; use_existing="$USE_EXISTING_D" ;;
+          esac
+          if [[ -z "$version_json" || "$use_existing" != "true" ]]; then
+            continue
+          fi
+          tag=$(echo "$version_json" | jq -r '.tag')
+          src_dir="${INPUT_PATH}/${INPUT_SDK}/src/${tag}"
+          echo "Symlinking existing platform otdfctl to ${src_dir}"
+          mkdir -p "$(dirname "$src_dir")"
+          ln -sfn "$PLATFORM_OTDFCTL_DIR" "$src_dir"
+          if [ ! -e "$src_dir" ]; then
+            echo "::error::Symlink target does not exist: $PLATFORM_OTDFCTL_DIR"
+            exit 1
+          fi
+        done
+      env:
+        PLATFORM_OTDFCTL_DIR: ${{ inputs.platform-otdfctl-dir }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SDK: ${{ inputs.sdk }}
+        VERSION_A: ${{ steps.resolve.outputs.version-a }}
+        VERSION_B: ${{ steps.resolve.outputs.version-b }}
+        VERSION_C: ${{ steps.resolve.outputs.version-c }}
+        VERSION_D: ${{ steps.resolve.outputs.version-d }}
+        USE_EXISTING_A: ${{ steps.check-source.outputs.use-existing-platform-dir-a }}
+        USE_EXISTING_B: ${{ steps.check-source.outputs.use-existing-platform-dir-b }}
+        USE_EXISTING_C: ${{ steps.check-source.outputs.use-existing-platform-dir-c }}
+        USE_EXISTING_D: ${{ steps.check-source.outputs.use-existing-platform-dir-d }}
+
+    - name: checkout version a
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      if: >-
+        steps.resolve.outputs.version-a != ''
+        && steps.check-source.outputs.needs-checkout-a == 'true'
+      with:
+        path: ${{ steps.check-source.outputs.checkout-path-a }}
+        persist-credentials: false
+        ref: ${{ fromJson(steps.resolve.outputs.version-a).sha }}
+        repository: ${{ steps.check-source.outputs.checkout-repo-a }}
+
+    - name: checkout version b
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      if: >-
+        steps.resolve.outputs.version-b != ''
+        && steps.check-source.outputs.needs-checkout-b == 'true'
+      with:
+        path: ${{ steps.check-source.outputs.checkout-path-b }}
+        persist-credentials: false
+        ref: ${{ fromJson(steps.resolve.outputs.version-b).sha }}
+        repository: ${{ steps.check-source.outputs.checkout-repo-b }}
+
+    - name: checkout version c
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      if: >-
+        steps.resolve.outputs.version-c != ''
+        && steps.check-source.outputs.needs-checkout-c == 'true'
+      with:
+        path: ${{ steps.check-source.outputs.checkout-path-c }}
+        persist-credentials: false
+        ref: ${{ fromJson(steps.resolve.outputs.version-c).sha }}
+        repository: ${{ steps.check-source.outputs.checkout-repo-c }}
+
+    - name: checkout version d
+      uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      if: >-
+        steps.resolve.outputs.version-d != ''
+        && steps.check-source.outputs.needs-checkout-d == 'true'
+      with:
+        path: ${{ steps.check-source.outputs.checkout-path-d }}
+        persist-credentials: false
+        ref: ${{ fromJson(steps.resolve.outputs.version-d).sha }}
+        repository: ${{ steps.check-source.outputs.checkout-repo-d }}
+
+    - name: symlink freshly checked-out platform sources
+      shell: bash
+      run: |
+        # For platform-source versions that were checked out (not reusing the
+        # existing dir), symlink {platform-src}/{tag}/otdfctl → src/{tag} so
+        # the Makefile discovers them.
+        for slot in a b c d; do
+          case "$slot" in
+            a) is_platform="$IS_PLATFORM_A" ; needs_checkout="$NEEDS_CHECKOUT_A"
+               checkout_path="$CHECKOUT_PATH_A" ; version_json="$VERSION_A" ;;
+            b) is_platform="$IS_PLATFORM_B" ; needs_checkout="$NEEDS_CHECKOUT_B"
+               checkout_path="$CHECKOUT_PATH_B" ; version_json="$VERSION_B" ;;
+            c) is_platform="$IS_PLATFORM_C" ; needs_checkout="$NEEDS_CHECKOUT_C"
+               checkout_path="$CHECKOUT_PATH_C" ; version_json="$VERSION_C" ;;
+            d) is_platform="$IS_PLATFORM_D" ; needs_checkout="$NEEDS_CHECKOUT_D"
+               checkout_path="$CHECKOUT_PATH_D" ; version_json="$VERSION_D" ;;
+          esac
+          if [[ "$is_platform" != "true" || "$needs_checkout" != "true" || -z "$version_json" ]]; then
+            continue
+          fi
+          tag=$(echo "$version_json" | jq -r '.tag')
+          src_dir="${INPUT_PATH}/${INPUT_SDK}/src/${tag}"
+          otdfctl_dir="$(cd "${checkout_path}/otdfctl" && pwd)"
+          echo "Symlinking freshly checked-out platform otdfctl ${otdfctl_dir} → ${src_dir}"
+          mkdir -p "$(dirname "$src_dir")"
+          ln -sfn "$otdfctl_dir" "$src_dir"
+          if [ ! -e "$src_dir" ]; then
+            echo "::error::Symlink target does not exist: ${otdfctl_dir} (does the platform repo contain an otdfctl/ directory?)"
+            exit 1
+          fi
+        done
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SDK: ${{ inputs.sdk }}
+        VERSION_A: ${{ steps.resolve.outputs.version-a }}
+        VERSION_B: ${{ steps.resolve.outputs.version-b }}
+        VERSION_C: ${{ steps.resolve.outputs.version-c }}
+        VERSION_D: ${{ steps.resolve.outputs.version-d }}
+        IS_PLATFORM_A: ${{ steps.check-source.outputs.is-platform-a }}
+        IS_PLATFORM_B: ${{ steps.check-source.outputs.is-platform-b }}
+        IS_PLATFORM_C: ${{ steps.check-source.outputs.is-platform-c }}
+        IS_PLATFORM_D: ${{ steps.check-source.outputs.is-platform-d }}
+        NEEDS_CHECKOUT_A: ${{ steps.check-source.outputs.needs-checkout-a }}
+        NEEDS_CHECKOUT_B: ${{ steps.check-source.outputs.needs-checkout-b }}
+        NEEDS_CHECKOUT_C: ${{ steps.check-source.outputs.needs-checkout-c }}
+        NEEDS_CHECKOUT_D: ${{ steps.check-source.outputs.needs-checkout-d }}
+        CHECKOUT_PATH_A: ${{ steps.check-source.outputs.checkout-path-a }}
+        CHECKOUT_PATH_B: ${{ steps.check-source.outputs.checkout-path-b }}
+        CHECKOUT_PATH_C: ${{ steps.check-source.outputs.checkout-path-c }}
+        CHECKOUT_PATH_D: ${{ steps.check-source.outputs.checkout-path-d }}
+
+    - name: post checkout cleanups
+      if: inputs.sdk == 'java'
+      run: |
+        SDK_MGR_DIR="$(cd "$INPUT_PATH/../.." && pwd)/otdf-sdk-mgr"
+        uv run --project "$SDK_MGR_DIR" otdf-sdk-mgr java-fixup
+      shell: bash
+      env:
+        INPUT_PATH: ${{ inputs.path }}
+
+    - name: save env from version-info
+      shell: bash
+      run: |
+        # Iterate over each version and save the env variable to a file
+        for version in $(echo "${version_info}" | jq -c '.[]'); do
+          tag=$(echo "$version" | jq -r '.tag')
+          env=$(echo "$version" | jq -r '.env // empty')
+          if [[ -n "$env" ]]; then
+            echo "$env" > "$INPUT_PATH/$INPUT_SDK/src/${tag}.env"
+          fi
+        done
+      env:
+        version_info: ${{ inputs.version-info }}
+        INPUT_PATH: ${{ inputs.path }}
+        INPUT_SDK: ${{ inputs.sdk }}

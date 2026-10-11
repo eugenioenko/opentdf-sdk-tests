@@ -1,0 +1,259 @@
+#!/usr/bin/env bash
+#
+# Common shell wrapper used to interface to SDK implementation.
+#
+# Usage: ./cli.sh <encrypt | decrypt> <src-file> <dst-file> <fmt>
+#
+# Extended Utilities:
+#
+# ./cli.sh supports <feature>
+#   Check if the SDK supports a specific feature.
+#
+# Extended Configuration:
+#  XT_WITH_ECDSA_BINDING [boolean] - Use ECDSA binding for encryption
+#  XT_WITH_ECWRAP [boolean] - Use EC wrap for encryption/decryption
+#  XT_WITH_VERIFY_ASSERTIONS [boolean] - Verify assertions during decryption
+#  XT_WITH_ASSERTIONS [string] - Path to assertions file, or JSON encoded as string
+#  XT_WITH_ASSERTION_VERIFICATION_KEYS [string] - Path to assertion verification private key file
+#  XT_WITH_ATTRIBUTES [string] - Attributes to be used for encryption
+#  XT_WITH_MIME_TYPE [string] - MIME type for the encrypted file
+#
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+
+cmd=("$SCRIPT_DIR"/otdfctl)
+if [[ ! -f "$SCRIPT_DIR"/otdfctl ]]; then
+  if [[ -f "$SCRIPT_DIR/.version" ]]; then
+    VERSION_SPEC=$(tr -d '[:space:]' <"$SCRIPT_DIR/.version")
+    if [[ "$VERSION_SPEC" == *@* ]]; then
+      # New format: module-path@version
+      cmd=(go run "$VERSION_SPEC")
+    else
+      # Legacy format: bare version tag, default to standalone module
+      cmd=(go run "github.com/opentdf/otdfctl@${VERSION_SPEC}")
+    fi
+  else
+    cmd=(go run "github.com/opentdf/otdfctl@latest")
+  fi
+fi
+
+if [ "$1" == "supports" ]; then
+  case "$2" in
+    autoconfigure | ns_grants)
+      exit 0
+      ;;
+    obligations)
+      # Obligations support from SDK version 0.10.0
+      set -o pipefail
+      "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 10) || ($1 == 0 && $2 == 10 && $3 >= 0)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    attribute_traversal)
+      # Attribute traversal support from go-sdk version >= 0.12.0
+      set -o pipefail
+      "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 >= 12)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    assertions | assertion_verification)
+      "${cmd[@]}" help decrypt | grep with-assertion-verification-keys
+      exit $?
+      ;;
+    kasallowlist)
+      "${cmd[@]}" help decrypt | grep kas-allowlist
+      exit $?
+      ;;
+    key_management)
+      # Advanced key management from SDK version 0.5.1
+      "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 5) || ($1 == 0 && $2 == 5 && $3 >= 1)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    ecwrap)
+      if "${cmd[@]}" help encrypt | grep wrapping-key; then
+        # while the otdfctl app may support ecwrap, but sdk versions 0.3.28 and earlier uses the old salt
+        set -o pipefail
+        "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 3) || ($1 == 0 && $2 == 3 && $3 >= 29)) exit 0; else exit 1; }'
+        exit $?
+      else
+        echo "ecwrap not supported"
+        exit 1
+      fi
+      ;;
+    hexless)
+      set -o pipefail
+      # Schema version 4.3.0 introduced hexless
+      "${cmd[@]}" --version --json | jq -re .schema_version | awk -F. '{ if ($1 > 4 || ($1 == 4 && $2 >= 2)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    hexaflexible)
+      "${cmd[@]}" help encrypt | grep target-mode
+      exit $?
+      ;;
+    gmac_root_rejected)
+      # DSPX-4703: does decrypt refuse a manifest downgraded to
+      # `rootSignature.alg: GMAC`? Unanswerable here, and always no. The check
+      # runs inside root-signature validation, which needs the unwrapped
+      # payload key and so happens after the KAS rewrap -- there is no flag,
+      # subcommand or version field to grep for.
+      #
+      # test_root_signature forges a root and watches the reader instead, and
+      # only consults this as an escape hatch: XT_FORCE_SUPPORTS=gmac_root_rejected
+      # runs the exploit cases unconditionally, turning a vulnerable build's
+      # skip into a red repro.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "gmac_root_rejected is not probeable: the fix adds no CLI surface"
+      exit 1
+      ;;
+    connectrpc)
+      set -o pipefail
+      # SDK version 0.4.5 introduces connectrpc client side
+      "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 4) || ($1 == 0 && $2 == 4 && $3 >= 5)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    better-messages-2024)
+      # In November 2024, we added more. detailed error messages
+      # These appeared in go sdk 0.3.28
+      set -o pipefail
+      "${cmd[@]}" --version --json | jq -re .sdk_version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 3) || ($1 == 0 && $2 == 3 && $3 >= 18)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    mechanism-xwing)
+      set -o pipefail
+      "${cmd[@]}" help policy kas-registry key create | grep -i hpqt:xwing
+      exit $?
+      ;;
+    mechanism-secpmlkem)
+      set -o pipefail
+      "${cmd[@]}" help policy kas-registry key create | grep -i hpqt:secp256r1-mlkem768
+      exit $?
+      ;;
+    mechanism-mlkem)
+      set -o pipefail
+      "${cmd[@]}" help policy kas-registry key create | grep -iE 'mlkem:768|mlkem:1024'
+      exit $?
+      ;;
+    dpop | dpop_nonce_challenge)
+      set -o pipefail
+      "${cmd[@]}" --version --json | jq -e --arg f "$2" '.supported_features |
+ index($f)'
+      exit $?
+      ;;
+    chunky)
+      # Default an absent per-segment segmentSize/encryptedSegmentSize from
+      # the manifest-level defaults. Broken in every go build to date: a
+      # web-sdk TDF over 1 MiB fails in the GMAC check. Fix tracked as
+      # DSPX-4590; turn this into a version gate when it releases.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "chunky unsupported: see DSPX-4590"
+      exit 1
+      ;;
+    zip64-at-2gib)
+      # Switch to the ZIP64 sentinel plus extra field at 2 GiB rather than at
+      # 4 GiB, so a reader that widens the central-directory fields with a
+      # signed read can still open the container. Every go build to date gates
+      # on ^uint32(0) and so writes a real 32-bit value across the whole
+      # 2-4 GiB band. Fix tracked as DSPX-4590 finding 1 (platform#3981, open);
+      # turn this into a version gate when it releases.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "zip64-at-2gib unsupported: see DSPX-4590"
+      exit 1
+      ;;
+    *)
+      echo "Unknown feature: $2"
+      exit 2
+      ;;
+  esac
+fi
+
+XTEST_DIR="$SCRIPT_DIR"
+while [ "$XTEST_DIR" != "/" ]; do
+  if [ -f "$XTEST_DIR/pyproject.toml" ] && grep -q 'name = "xtest"' "$XTEST_DIR/pyproject.toml"; then
+    break
+  fi
+  XTEST_DIR=$(dirname "$XTEST_DIR")
+done
+
+if [ "$XTEST_DIR" = "/" ]; then
+  echo "xtest root (pyproject.toml with name = \"xtest\") not found."
+  exit 1
+fi
+
+if [ -f "$XTEST_DIR/test.env" ]; then
+  # shellcheck disable=SC1091
+  source "$XTEST_DIR/test.env"
+else
+  echo "test.env not found in xtest root: $XTEST_DIR"
+  exit 1
+fi
+
+args=(
+  -o "$3"
+  --host "$PLATFORMURL"
+  --tls-no-verify
+  --log-level debug
+  --with-client-creds '{"clientId":"'"$CLIENTID"'","clientSecret":"'"$CLIENTSECRET"'"}'
+)
+if [ "$4" != "ztdf" ]; then
+  echo "Unsupported container format: $4"
+  exit 2
+fi
+
+if [ "$1" == "encrypt" ]; then
+  if [ -n "$XT_WITH_MIME_TYPE" ]; then
+    args+=(--mime-type "$XT_WITH_MIME_TYPE")
+  fi
+
+  if [ -n "$XT_WITH_ATTRIBUTES" ]; then
+    args+=(--attr "$XT_WITH_ATTRIBUTES")
+  fi
+
+  if [ -n "$XT_WITH_ASSERTIONS" ]; then
+    args+=(--with-assertions "$XT_WITH_ASSERTIONS")
+  fi
+  if [ "$XT_WITH_ECWRAP" == 'true' ]; then
+    args+=(--wrapping-key-algorithm "ec:secp256r1")
+  fi
+  if [ "$XT_WITH_ECDSA_BINDING" == "true" ]; then
+    args+=(--ecdsa-binding)
+  fi
+  if [ "$XT_WITH_PLAINTEXT_POLICY" == "true" ]; then
+    args+=(--policy-mode plaintext)
+  fi
+  if [ -n "$XT_WITH_TARGET_MODE" ]; then
+    args+=(--target-mode "$XT_WITH_TARGET_MODE")
+  fi
+  echo "${cmd[@]}" encrypt "${args[@]}" "$2"
+  if ! "${cmd[@]}" encrypt "${args[@]}" "$2"; then
+    exit 1
+  fi
+  if [ -f "${3}.tdf" ]; then
+    # go helpfully adds a tdf extension to all files
+    mv "${3}.tdf" "${3}"
+  fi
+elif [ "$1" == "decrypt" ]; then
+  if [ -n "$XT_WITH_ASSERTION_VERIFICATION_KEYS" ]; then
+    args+=(--with-assertion-verification-keys "$XT_WITH_ASSERTION_VERIFICATION_KEYS")
+  fi
+  if [ "$XT_WITH_ECWRAP" == 'true' ]; then
+    args+=(--session-key-algorithm "ec:secp256r1")
+  fi
+  if [ "$XT_WITH_VERIFY_ASSERTIONS" == 'false' ]; then
+    args+=(--no-verify-assertions)
+  fi
+  if [ -n "$XT_WITH_KAS_ALLOW_LIST" ]; then
+    args+=(--kas-allowlist "$XT_WITH_KAS_ALLOW_LIST")
+  fi
+  # bypassing the allowlist may expose potential security risks
+  if [ "$XT_WITH_IGNORE_KAS_ALLOWLIST" == "true" ]; then
+    args+=(--kas-allowlist '*')
+  fi
+  echo "${cmd[@]}" decrypt "${args[@]}" "$2"
+  "${cmd[@]}" decrypt "${args[@]}" "$2"
+else
+  echo "Incorrect argument provided"
+  exit 1
+fi

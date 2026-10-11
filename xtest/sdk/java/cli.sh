@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# Common shell wrapper used to interface to SDK implementation.
+#
+# Usage: ./cli.sh <encrypt | decrypt> <src-file> <dst-file> <fmt>
+#
+# Extended Utilities:
+#
+# ./cli.sh supports <feature>
+#   Check if the SDK supports a specific feature.
+#
+# Extended Configuration:
+#  XT_WITH_ECDSA_BINDING [boolean] - Use ECDSA binding for encryption
+#  XT_WITH_ECWRAP [boolean] - Use EC wrap for encryption/decryption
+#  XT_WITH_VERIFY_ASSERTIONS [boolean] - Verify assertions during decryption
+#  XT_WITH_ASSERTIONS [string] - Path to assertions file, or JSON encoded as string
+#  XT_WITH_ASSERTION_VERIFICATION_KEYS [string] - Path to assertion verification private key file
+#  XT_WITH_ATTRIBUTES [string] - Attributes to be used for encryption
+#  XT_WITH_MIME_TYPE [string] - MIME type for the encrypted file
+#  XT_WITH_TARGET_MODE [string] - Target spec mode for the encrypted file
+#
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+
+XTEST_DIR="$SCRIPT_DIR"
+while [ "$XTEST_DIR" != "/" ]; do
+  if [ -f "$XTEST_DIR/pyproject.toml" ] && grep -q 'name = "xtest"' "$XTEST_DIR/pyproject.toml"; then
+    break
+  fi
+  XTEST_DIR=$(dirname "$XTEST_DIR")
+done
+
+if [ "$XTEST_DIR" = "/" ]; then
+  echo "xtest root (pyproject.toml with name = \"xtest\") not found."
+  exit 1
+fi
+
+if [ -f "$XTEST_DIR/test.env" ]; then
+  # shellcheck disable=SC1091
+  source "$XTEST_DIR/test.env"
+else
+  echo "test.env not found in xtest root: $XTEST_DIR"
+  exit 1
+fi
+
+# Cache `java -jar cmdline.jar help [...]` output to avoid paying JVM startup
+# (typically 150-500ms) for the capability probes on every encrypt/decrypt.
+# Keyed by the jar's mtime so a reinstall invalidates the cache. stderr is
+# discarded to keep JVM warnings (reflective-access, agent notices) out of logs.
+jar_help() {
+  local jar="$SCRIPT_DIR/cmdline.jar"
+  local mtime
+  mtime=$(stat -c %Y "$jar" 2>/dev/null || stat -f %m "$jar" 2>/dev/null || echo 0)
+  local key
+  key=$(printf '%s' "$*" | tr -c 'a-zA-Z0-9' '_')
+  local uid
+  uid=$(id -u 2>/dev/null || echo default)
+  local cache="${TMPDIR:-/tmp}/xtest-java-help-${uid}-${mtime}-${key}"
+  if [[ ! -f "$cache" ]]; then
+    # Write to a process-unique temp file, then rename: concurrent xdist
+    # workers see either no cache or the complete file, never a partial read.
+    local tmp="${cache}.$$"
+    java -jar "$jar" help "$@" >"$tmp" 2>/dev/null
+    mv -f "$tmp" "$cache"
+  fi
+  cat "$cache"
+  return 0
+}
+
+if [ "$1" == "supports" ]; then
+  case "$2" in
+    autoconfigure | ns_grants)
+      exit 0
+      ;;
+    assertions)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep with-assertions
+      exit $?
+      ;;
+    assertion_verification)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help decrypt | grep with-assertion-verification-keys
+      exit $?
+      ;;
+    kasallowlist)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help decrypt | grep kas-allowlist
+      exit $?
+      ;;
+    key_management)
+      # Advanced key management from SDK version >= 0.10.0
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar --version | jq -re .version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 >= 10)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    ecwrap)
+      set -o pipefail
+      if java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep encap-key; then
+        # versions 0.7.6 and earlier used an older value for EC HKDF salt; check for 0.7.7 or later
+        java -jar "$SCRIPT_DIR"/cmdline.jar --version | jq -re .version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 > 7) || ($1 == 0 && $2 == 7 && $3 >= 7)) exit 0; else exit 1; }'
+        exit $?
+      else
+        echo "ecwrap not supported"
+        exit 1
+      fi
+      ;;
+
+    hexless)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar --version | jq -re .tdfSpecVersion | awk -F. '{ if ($1 > 4 || ($1 == 4 && $2 > 2) || ($1 == 4 && $2 == 3 && $3 >= 0)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+
+    hexaflexible)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep with-target-mode
+      exit $?
+      ;;
+    gmac_root_rejected)
+      # DSPX-4703: does decrypt refuse a manifest downgraded to
+      # `rootSignature.alg: GMAC`? Unanswerable here, and always no. The check
+      # runs inside root-signature validation, which needs the unwrapped
+      # payload key and so happens after the KAS rewrap -- there is no flag,
+      # subcommand or version field to grep for.
+      #
+      # test_root_signature forges a root and watches the reader instead, and
+      # only consults this as an escape hatch: XT_FORCE_SUPPORTS=gmac_root_rejected
+      # runs the exploit cases unconditionally, turning a vulnerable build's
+      # skip into a red repro.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "gmac_root_rejected is not probeable: the fix adds no CLI surface"
+      exit 1
+      ;;
+    attribute_traversal)
+      echo "attribute_traversal not supported"
+      exit 1
+      ;;
+
+    mechanism-mlkem)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep -i "mlkem:768"
+      exit $?
+      ;;
+    mechanism-rsa-4096 | mechanism-ec-curves-384-521)
+      # rsa4096 support in >= 0.13.0
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar --version | jq -re .version | awk -F. '{ if ($1 > 0 || ($1 == 0 && $2 >= 13)) exit 0; else exit 1; }'
+      exit $?
+      ;;
+    mechanism-secpmlkem)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep -i secp256r1-mlkem768
+      exit $?
+      ;;
+    mechanism-xwing)
+      set -o pipefail
+      java -jar "$SCRIPT_DIR"/cmdline.jar help encrypt | grep -i xwing
+      exit $?
+      ;;
+    dpop)
+      java -jar "$SCRIPT_DIR"/cmdline.jar supports dpop
+      exit $?
+      ;;
+    dpop_nonce_challenge)
+      java -jar "$SCRIPT_DIR"/cmdline.jar supports dpop_nonce_challenge
+      exit $?
+      ;;
+    chunky)
+      # Default an absent per-segment segmentSize/encryptedSegmentSize from
+      # the manifest-level defaults. Broken in every java build to date: a
+      # web-sdk TDF over 1 MiB fails in the GMAC check. Fix tracked as
+      # DSPX-4589; turn this into a version gate when it releases.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "chunky unsupported: see DSPX-4589"
+      exit 1
+      ;;
+    zip64-at-2gib)
+      # Switch to the ZIP64 sentinel plus extra field at 2 GiB rather than at
+      # 4 GiB. java-sdk adopted MAX_NON_ZIP64_VALUE = Integer.MAX_VALUE in
+      # java-sdk#393, merged 2026-09-03 and not in any release through v0.18.0
+      # -- and a branch build reports the last released version here, so this
+      # answers no for java@main too. Evaluate such a build with
+      # XT_FORCE_SUPPORTS=zip64-at-2gib; turn this into a version gate when the
+      # fix releases.
+      #
+      # Explicit rather than falling through to "Unknown feature" so that a
+      # typo'd feature name in tdfs.py cannot pass for a known-missing one.
+      echo "zip64-at-2gib unsupported: needs the release carrying java-sdk#393"
+      exit 1
+      ;;
+    *)
+      echo "Unknown feature: $2"
+      exit 2
+      ;;
+  esac
+fi
+
+args=(
+  "--client-id=$CLIENTID"
+  "--client-secret=$CLIENTSECRET"
+  "--plaintext"
+)
+
+# when we added support for KAS allowlist, we changed the platform endpoint format to require scheme
+if jar_help decrypt | grep -q kas-allowlist; then
+  args+=("--platform-endpoint=$PLATFORMURL")
+else
+  args+=("--platform-endpoint=$PLATFORMENDPOINT")
+fi
+
+args+=("$1")
+
+if [ "$1" == "encrypt" ]; then
+  args+=("--kas-url=$KASURL")
+
+  if [ "$XT_WITH_ECDSA_BINDING" == "true" ]; then
+    args+=(--ecdsa-binding)
+  fi
+
+  if [ "$XT_WITH_ECWRAP" == 'true' ]; then
+    args+=(--encap-key-type="ec:secp256r1")
+  fi
+
+  if [ "$XT_WITH_PLAINTEXT_POLICY" == "true" ]; then
+    args+=(--policy-type="plaintext")
+  fi
+else
+  if [ "$XT_WITH_ECWRAP" == 'true' ]; then
+    args+=(--rewrap-key-type="ec:secp256r1")
+  fi
+fi
+
+if [ "$1" == "decrypt" ]; then
+  if [ -n "$XT_WITH_KAS_ALLOW_LIST" ]; then
+    args+=(--kas-allowlist="$XT_WITH_KAS_ALLOW_LIST")
+  fi
+
+  if [ "$XT_WITH_IGNORE_KAS_ALLOWLIST" == "true" ]; then
+    args+=(--ignore-kas-allowlist=true)
+  fi
+fi
+
+if [ -n "$XT_WITH_MIME_TYPE" ]; then
+  args+=(--mime-type "$XT_WITH_MIME_TYPE")
+fi
+
+if [ -n "$XT_WITH_ATTRIBUTES" ]; then
+  args+=(--attr "$XT_WITH_ATTRIBUTES")
+fi
+
+if [ -n "$XT_WITH_ASSERTIONS" ]; then
+  args+=(--with-assertions "$XT_WITH_ASSERTIONS")
+fi
+
+if [ -n "$XT_WITH_ASSERTION_VERIFICATION_KEYS" ]; then
+  args+=(--with-assertion-verification-keys "$XT_WITH_ASSERTION_VERIFICATION_KEYS")
+fi
+
+if [ "$XT_WITH_VERIFY_ASSERTIONS" == 'false' ]; then
+  args+=(--with-assertion-verification-disabled)
+fi
+
+if [ -n "$XT_WITH_TARGET_MODE" ]; then
+  args+=(--with-target-mode "$XT_WITH_TARGET_MODE")
+fi
+
+if jar_help | grep -q -- '--verbose'; then
+  args+=(--verbose)
+fi
+
+echo java -jar "$SCRIPT_DIR"/cmdline.jar "${args[@]}" --file="$2" ">" "$3"
+java -jar "$SCRIPT_DIR"/cmdline.jar "${args[@]}" --file="$2" >"$3"

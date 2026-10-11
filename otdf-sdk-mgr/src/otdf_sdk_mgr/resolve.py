@@ -1,0 +1,397 @@
+"""Version resolution for SDK tags/branches/SHAs."""
+
+from __future__ import annotations
+
+import re
+from typing import NotRequired, TypedDict, TypeGuard
+
+import git.exc
+from git import Git
+
+from otdf_sdk_mgr.config import (
+    JAVA_PLATFORM_BRANCH_MAP,
+    LTS_VERSIONS,
+    SDK_GIT_URLS,
+    SDK_NPM_PACKAGES,
+)
+
+
+class ResolveSuccess(TypedDict):
+    sdk: str
+    alias: str
+    env: NotRequired[str]
+    head: NotRequired[bool]
+    pr: NotRequired[str]
+    release: NotRequired[str]
+    sha: str
+    tag: str
+
+
+class ResolveError(TypedDict):
+    sdk: str
+    alias: str
+    err: str
+
+
+ResolveResult = ResolveSuccess | ResolveError
+
+
+def is_resolve_error(val: ResolveResult) -> TypeGuard[ResolveError]:
+    """Check if the given value is a ResolveError type."""
+    return "err" in val
+
+
+def is_resolve_success(val: ResolveResult) -> TypeGuard[ResolveSuccess]:
+    """Check if the given value is a ResolveSuccess type."""
+    return "err" not in val and "sha" in val and "tag" in val
+
+
+MERGE_QUEUE_REGEX = (
+    r"^refs/heads/gh-readonly-queue/(?P<branch>[^/]+)/pr-(?P<pr_number>\d+)-(?P<sha>[a-f0-9]{40})$"
+)
+
+SHA_REGEX = r"^[a-f0-9]{7,64}$"
+
+
+def _ref_specificity(ref: str) -> int:
+    """Sort key for refs that share a SHA, lowest wins.
+
+    PR head, then merge-queue, then a branch, then a tag, then anything else
+    (e.g. the symbolic ``HEAD`` that ``ls-remote`` lists alongside the branch
+    it points at — never a useful dist tag on its own). A branch is preferred
+    over a tag because the SHA path resolves a commit-under-test: the branch
+    case flags it as a ``head`` so it is built from source, whereas a tag that
+    happens to point at the same commit would not be.
+    """
+    if ref.startswith("refs/pull/"):
+        return 0
+    if re.match(MERGE_QUEUE_REGEX, ref):
+        return 1
+    if ref.startswith("refs/heads/"):
+        return 2
+    if ref.startswith("refs/tags/"):
+        return 3
+    return 4
+
+
+def _classify_sha_match(
+    sdk: str,
+    version: str,
+    sha: str,
+    ref: str,
+    infix: str | None,
+) -> ResolveSuccess:
+    """Turn a single (sha, ref) pair matched by a SHA lookup into a result.
+
+    Normalizes the ref into a filesystem-safe ``tag`` (slashes flattened to
+    ``--``) and flags branch-like refs (PR heads, merge-queue refs, branches)
+    as ``head`` so callers know to build from source rather than fetch a
+    released artifact. Shared by both single- and multi-match SHA lookups so a
+    merge-queue commit pointed at by only one ref is handled the same as one
+    pointed at by several.
+    """
+    if ref.startswith("refs/pull/"):
+        pr_number = ref.split("/")[2]
+        return {
+            "sdk": sdk,
+            "alias": version,
+            "head": True,
+            "pr": pr_number,
+            "sha": sha,
+            "tag": f"pull-{pr_number}",
+        }
+
+    mq_match = re.match(MERGE_QUEUE_REGEX, ref)
+    if mq_match:
+        # Both named groups are required by MERGE_QUEUE_REGEX, so a match
+        # guarantees they are non-empty.
+        return {
+            "sdk": sdk,
+            "alias": version,
+            "head": True,
+            "pr": mq_match.group("pr_number"),
+            "sha": sha,
+            "tag": f"mq-{mq_match.group('branch')}-{mq_match.group('pr_number')}",
+        }
+
+    if ref.startswith("refs/heads/"):
+        branch = ref.removeprefix("refs/heads/")
+        return {
+            "sdk": sdk,
+            "alias": version,
+            "head": True,
+            "sha": sha,
+            "tag": branch.replace("/", "--"),
+        }
+
+    tag = ref.removeprefix("refs/tags/")
+    if infix:
+        tag = tag.removeprefix(f"{infix}/")
+    return {
+        "sdk": sdk,
+        "alias": version,
+        "sha": sha,
+        # Flatten any slashes left in a namespaced tag (no-op for plain semver)
+        # so it can't reintroduce a nested dist/<tag>/ path.
+        "tag": tag.replace("/", "--"),
+    }
+
+
+def _try_resolve_js_npm(
+    sdk: str,
+    version: str,
+    alias: str,
+    infix_stripped_tags: list[tuple[str, str]],
+    infix: str | None,
+) -> ResolveSuccess | None:
+    """Try to resolve a JS version from the npm registry.
+
+    Returns a ResolveSuccess if the version exists on npm, None otherwise.
+    The sha is populated from git tags on a best-effort basis (empty string if not found),
+    since it is only needed for source checkouts which are skipped for artifact installs.
+    """
+    from otdf_sdk_mgr.registry import fetch_json
+
+    package = SDK_NPM_PACKAGES.get(sdk)
+    if not package:
+        return None
+
+    npm_version = version.lstrip("v")
+    try:
+        data = fetch_json(f"https://registry.npmjs.org/{package}/{npm_version}")
+    except (OSError, ValueError):  # network/HTTP errors, or a non-JSON body
+        return None
+
+    # npm may resolve a dist-tag (e.g. "next") to a concrete version
+    resolved_version = data.get("version", npm_version)
+    tag = resolved_version
+
+    # Look up SHA from git tags (best-effort; not required for artifact installs)
+    sha = ""
+    candidates = {resolved_version, f"v{resolved_version}"}
+    for s, t in infix_stripped_tags:
+        if t in candidates:
+            sha = s
+            break
+
+    release = f"{infix}/{tag}" if infix else tag
+    return {
+        "sdk": sdk,
+        "alias": alias,
+        "release": release,
+        "sha": sha,
+        "tag": tag,
+    }
+
+
+def lookup_additional_options(sdk: str, version: str) -> str | None:
+    """Look up additional build options for a given SDK version."""
+    if sdk != "java":
+        return None
+    version = version.removeprefix("v")
+    branch = JAVA_PLATFORM_BRANCH_MAP.get(version)
+    if branch:
+        return f"PLATFORM_BRANCH={branch}"
+    return None
+
+
+def resolve(
+    sdk: str,
+    version: str,
+    infix: str | None,
+) -> ResolveResult:
+    """Resolve a version spec to a concrete SHA and tag.
+
+    For sdk='go', resolution targets the platform monorepo's otdfctl/ subtree
+    (tags `otdfctl/vX.Y.Z`). Tags not found there fall back to the archived
+    opentdf/otdfctl repo (pre-v0.31.0). The `infix` argument is ignored for go.
+    """
+    if sdk == "go":
+        result = _resolve_against("go", version, "otdfctl", SDK_GIT_URLS["platform"])
+        if is_resolve_success(result):
+            return result
+        return _resolve_against("go", version, None, SDK_GIT_URLS["go"])
+
+    try:
+        sdk_url = SDK_GIT_URLS[sdk]
+    except KeyError:
+        return {"sdk": sdk, "alias": version, "err": f"unknown SDK: {sdk}"}
+    return _resolve_against(sdk, version, infix, sdk_url)
+
+
+def _resolve_against(
+    sdk: str,
+    version: str,
+    infix: str | None,
+    sdk_url: str,
+) -> ResolveResult:
+    """Run ls-remote-based resolution against a specific git URL."""
+    try:
+        repo = Git()
+        version = version.removeprefix("refs/heads/")
+        if version == "main":
+            all_heads = [r.split("\t") for r in repo.ls_remote(sdk_url, heads=True).split("\n")]
+            try:
+                sha, _ = next(tag for tag in all_heads if "refs/heads/main" in tag)
+            except StopIteration:
+                return {"sdk": sdk, "alias": version, "err": f"main branch not found in {sdk_url}"}
+            return {
+                "sdk": sdk,
+                "alias": version,
+                "head": True,
+                "sha": sha,
+                "tag": "main",
+            }
+
+        if re.match(SHA_REGEX, version):
+            ls_remote = [r.split("\t") for r in repo.ls_remote(sdk_url).split("\n")]
+            matching_tags = [(sha, tag) for (sha, tag) in ls_remote if sha.startswith(version)]
+            if not matching_tags:
+                return {
+                    "sdk": sdk,
+                    "alias": version[:7],
+                    "sha": version,
+                    "tag": version,
+                }
+            # A SHA can be pointed at by several refs at once — e.g. a merge-queue
+            # commit that is both a branch tip and a `gh-readonly-queue` ref.
+            # Prefer the most specific (PR > merge-queue > branch/tag) so the dist
+            # tag is meaningful and source-built refs get flagged as heads.
+            sha, ref = min(matching_tags, key=lambda st: _ref_specificity(st[1]))
+            return _classify_sha_match(sdk, version, sha, ref, infix)
+
+        if version.startswith("refs/pull/"):
+            merge_heads = [
+                r.split("\t") for r in repo.ls_remote(sdk_url).split("\n") if r.endswith(version)
+            ]
+            pr_number = version.split("/")[2]
+            if not merge_heads:
+                return {
+                    "sdk": sdk,
+                    "alias": version,
+                    "err": f"pull request {pr_number} not found in {sdk_url}",
+                }
+            sha, _ = merge_heads[0]
+            return {
+                "sdk": sdk,
+                "alias": version,
+                "head": True,
+                "pr": pr_number,
+                "sha": sha,
+                "tag": f"pull-{pr_number}",
+            }
+
+        remote_tags = [r.split("\t") for r in repo.ls_remote(sdk_url).split("\n")]
+        all_listed_tags = [
+            (sha, tag.split("refs/tags/")[-1]) for (sha, tag) in remote_tags if "refs/tags/" in tag
+        ]
+
+        all_listed_branches = {
+            tag.split("refs/heads/")[-1]: sha
+            for (sha, tag) in remote_tags
+            if tag.startswith("refs/heads/")
+        }
+
+        if version in all_listed_branches:
+            sha = all_listed_branches[version]
+            return {
+                "sdk": sdk,
+                "alias": version,
+                "head": True,
+                "sha": sha,
+                # Flattened the same way _classify_sha_match flattens a branch
+                # it reached by SHA: the tag becomes a single dist/<tag>/ and
+                # src/<tag>/ path component. A slash here nests those
+                # directories, and every consumer walks them one level deep --
+                # xtest's all_versions_of() lists dist/*/ and the go Makefile
+                # finds src/*/, so "feat/x" is discovered as a "feat" build
+                # with no cli.sh in it.
+                "tag": version.replace("/", "--"),
+            }
+
+        if infix and version.startswith(f"{infix}/"):
+            version = version.split(f"{infix}/")[-1]
+
+        listed_tags = all_listed_tags
+        if infix:
+            listed_tags = [
+                (sha, tag.split(f"{infix}/")[-1])
+                for (sha, tag) in listed_tags
+                if f"{infix}/" in tag
+            ]
+
+        # For JS: explicit version refs resolve via npm first so that pre-release and
+        # dist-tag refs (e.g. "0.9.0-beta.84", "next") work without a matching git tag.
+        if sdk in SDK_NPM_PACKAGES and version not in ("latest", "lts"):
+            npm_result = _try_resolve_js_npm(sdk, version, version, listed_tags, infix)
+            if npm_result is not None:
+                return npm_result
+
+        semver_regex = r"v?\d+\.\d+\.\d+$"
+        stable_tags = [(sha, tag) for (sha, tag) in listed_tags if re.search(semver_regex, tag)]
+        stable_tags.sort(key=lambda item: list(map(int, item[1].strip("v").split("."))))
+        alias = version
+        matching_tags = []
+        if version == "latest":
+            # For Java, check if CLI artifacts are available and fall back to source build if not
+            if sdk == "java":
+                from otdf_sdk_mgr.registry import list_java_github_releases
+
+                gh_releases = list_java_github_releases()
+                # Find the latest version with CLI artifact
+                versions_with_cli = [r for r in gh_releases if r.get("has_cli", False)]
+                if versions_with_cli:
+                    # Use the latest version that has CLI
+                    latest_with_cli_tag = versions_with_cli[-1]["version"]
+                    matching_tags = [
+                        (sha, tag)
+                        for (sha, tag) in stable_tags
+                        if tag in [latest_with_cli_tag, latest_with_cli_tag.lstrip("v")]
+                    ]
+                if not matching_tags:
+                    # No versions with CLI found, fall back to building latest from source
+                    sha, tag = stable_tags[-1]
+                    return {
+                        "sdk": sdk,
+                        "alias": alias,
+                        "head": True,  # Mark as head to trigger source checkout
+                        "sha": sha,
+                        "tag": tag,
+                    }
+            else:
+                matching_tags = stable_tags[-1:]
+        else:
+            if version == "lts":
+                if sdk not in LTS_VERSIONS:
+                    raise ValueError(
+                        f"No LTS version defined for SDK '{sdk}'. "
+                        f"Add it to LTS_VERSIONS in config.py."
+                    )
+                version = LTS_VERSIONS[sdk]
+            matching_tags = [
+                (sha, tag) for (sha, tag) in stable_tags if tag in [version, f"v{version}"]
+            ]
+            # If not found in stable tags, also search all tags (supports pre-release versions)
+            if not matching_tags:
+                matching_tags = [
+                    (sha, tag) for (sha, tag) in listed_tags if tag in [version, f"v{version}"]
+                ]
+        if not matching_tags:
+            raise ValueError(f"Tag [{version}] not found in [{sdk_url}]")
+        sha, tag = matching_tags[-1]
+        release = tag
+        if infix:
+            release = f"{infix}/{release}"
+        return {
+            "sdk": sdk,
+            "alias": alias,
+            "release": release,
+            "sha": sha,
+            "tag": tag,
+        }
+    except (git.exc.GitCommandError, ValueError) as e:
+        return {
+            "sdk": sdk,
+            "alias": version,
+            "err": f"Error resolving version {version} for {sdk}: {e}",
+        }

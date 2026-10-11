@@ -1,0 +1,12 @@
+# .gitignore for the xtest/sdk directory
+
+# All checked out projects with checkout-*.sh scripts.
+*/src
+*/dist
+
+# Generated helper build .env files
+*/*.env
+
+# generated binaries
+otdfctl-*
+otdfctl
