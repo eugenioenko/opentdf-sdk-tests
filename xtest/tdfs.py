@@ -100,7 +100,28 @@ def _kas_supports_algorithm(algorithm: str) -> bool:
         return False
 
 
-sdk_type = Literal["go", "java", "js"]
+sdk_type = Literal[
+    "go",
+    "java",
+    "js",
+    # Goalchemy-generated SDKs (github.com/eugenioenko/opentdf-sdk), one type
+    # per target so versions compare like the reference SDKs.
+    "gcgo",
+    "gcts",
+    "gcpy",
+    "gcjava",
+    "gccs",
+    "gcrs",
+    "gcc",
+    "gcswift",
+]
+
+#: SDK types whose `cli.sh supports` answers from the SDK's own feature list
+#: and that declare the post-quantum mechanisms as not planned, so a reader of
+#: that type skips a PQ cell instead of failing it.
+GC_SDK_TYPES: frozenset[sdk_type] = frozenset(
+    {"gcgo", "gcts", "gcpy", "gcjava", "gccs", "gcrs", "gcc", "gcswift"}
+)
 
 
 def is_sdk_type(val: str) -> TypeIs[sdk_type]:
@@ -1186,6 +1207,20 @@ def skip_pqc_hybrid_format_skew(encrypt_sdk: SDK | None = None) -> None:
                 f"{encrypt_sdk} predates lib/ocrypto v0.13.0; "
                 "hybrid KEM ciphertext format is incompatible with this platform"
             )
+
+
+def skip_pqc_decrypt_unsupported(decrypt_sdk: SDK, mechanism: feature_type) -> None:
+    """Skip when a gc reader cannot process the PQ ``mechanism`` under test.
+
+    The PQ cells gate only the encrypt SDK on purpose, to observe how readers
+    without explicit support handle the new KAO types. The generated SDKs
+    answer that question statically -- PQ wrapping is not planned for them and
+    their reader rejects such KAOs -- so for those readers the cell is a
+    skip with a reason rather than a failure. Reference readers keep the
+    observed behaviour.
+    """
+    if decrypt_sdk.sdk in GC_SDK_TYPES and not decrypt_sdk.supports(mechanism):
+        pytest.skip(f"{decrypt_sdk} sdk doesn't support [{mechanism}] on decrypt")
 
 
 def select_target_version(

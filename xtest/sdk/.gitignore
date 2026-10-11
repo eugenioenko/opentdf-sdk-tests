@@ -10,3 +10,7 @@
 # generated binaries
 otdfctl-*
 otdfctl
+
+# Goalchemy checkouts and intermediate builds of the generated SDK types
+/goalchemy/
+*/build

@@ -37,14 +37,22 @@ def get_sdk_dir() -> Path:
     return found
 
 
+# Goalchemy-generated SDK types, one per target, all built from source out of
+# the same repository (sdk/<type>/src/<ref> + make). No release installs yet.
+GC_SDKS = ["gcgo", "gcts", "gcpy", "gcjava", "gccs", "gcrs", "gcc", "gcswift"]
+GC_SDK_GIT_URL = "https://github.com/eugenioenko/opentdf-sdk.git"
+
+
 def get_sdk_dirs() -> dict[str, Path]:
     """Return per-SDK directories keyed by SDK name."""
     sdk_dir = get_sdk_dir()
-    return {
+    dirs = {
         "go": sdk_dir / "go",
         "js": sdk_dir / "js",
         "java": sdk_dir / "java",
     }
+    dirs.update({sdk: sdk_dir / sdk for sdk in GC_SDKS})
+    return dirs
 
 
 # Git repository URLs
@@ -53,6 +61,7 @@ SDK_GIT_URLS: dict[str, str] = {
     "java": "https://github.com/opentdf/java-sdk.git",
     "js": "https://github.com/opentdf/web-sdk.git",
     "platform": "https://github.com/opentdf/platform.git",
+    **{sdk: GC_SDK_GIT_URL for sdk in GC_SDKS},
 }
 
 SDK_NPM_PACKAGES: dict[str, str] = {
@@ -120,6 +129,7 @@ JAVA_PLATFORM_BRANCH_MAP: dict[str, str] = {
 SDK_BARE_REPOS: dict[str, str] = {
     "java": "java-sdk.git",
     "js": "web-sdk.git",
+    **{sdk: "opentdf-sdk.git" for sdk in GC_SDKS},
 }
 
 # Tag infixes for monorepo tag resolution

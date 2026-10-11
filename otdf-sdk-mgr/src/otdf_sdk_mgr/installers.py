@@ -12,6 +12,7 @@ from pathlib import Path
 
 from otdf_sdk_mgr.checkout import checkout_sdk_branch
 from otdf_sdk_mgr.config import (
+    GC_SDKS,
     GO_MODULE_PATH_PLATFORM,
     LTS_VERSIONS,
     get_sdk_dir,
@@ -139,10 +140,20 @@ def install_java_release(version: str, dist_dir: Path) -> None:
     print(f"  Java release {tag} installed to {dist_dir}")
 
 
+def install_gc_release(version: str, dist_dir: Path) -> None:
+    """The generated SDKs publish no release artifacts yet; source builds only."""
+    raise InstallError(
+        f"{dist_dir.parent.parent.name} has no released artifacts; "
+        f"build it from source with `otdf-sdk-mgr install tip --ref {version} "
+        f"{dist_dir.parent.parent.name}`"
+    )
+
+
 INSTALLERS = {
     "go": install_go_release,
     "js": install_js_release,
     "java": install_java_release,
+    **{sdk: install_gc_release for sdk in GC_SDKS},
 }
 
 
