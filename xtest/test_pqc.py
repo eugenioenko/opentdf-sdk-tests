@@ -81,6 +81,7 @@ def test_xwing_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-xwing"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-xwing")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
     tdfs.skip_pqc_hybrid_format_skew(encrypt_sdk)
@@ -134,6 +135,7 @@ def test_xwing_with_ec_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-xwing"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-xwing")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
     tdfs.skip_pqc_hybrid_format_skew(encrypt_sdk)
@@ -199,6 +201,7 @@ def test_secpmlkem_3_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-secpmlkem"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-secpmlkem")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
     tdfs.skip_pqc_hybrid_format_skew(encrypt_sdk)
@@ -278,6 +281,7 @@ def test_secpmlkem_5_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-secpmlkem"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-secpmlkem")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
     tdfs.skip_pqc_hybrid_format_skew(encrypt_sdk)
@@ -342,6 +346,7 @@ def test_mlkem_768_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-mlkem"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-mlkem")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
 
@@ -392,6 +397,7 @@ def test_mlkem_1024_roundtrip(
     encrypt_sdk.skip_if_unsupported(
         "key_management", "autoconfigure", "mechanism-mlkem"
     )
+    tdfs.skip_pqc_decrypt_unsupported(decrypt_sdk, "mechanism-mlkem")
     tdfs.skip_connectrpc_skew(encrypt_sdk, decrypt_sdk, pfs)
     tdfs.skip_hexless_skew(encrypt_sdk, decrypt_sdk)
 
