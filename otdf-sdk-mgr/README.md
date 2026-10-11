@@ -68,6 +68,16 @@ otdf-sdk-mgr java-fixup
 - **JS**: Runs `npm install @opentdf/ctl@{version}` into the dist directory; `cli.sh` uses `npx` from local `node_modules/`
 - **Java**: Downloads `cmdline.jar` from GitHub Releases; `cli.sh` uses `java -jar cmdline.jar`
 
+## Generated SDK Types
+
+The Goalchemy-generated SDKs from [eugenioenko/opentdf-sdk](https://github.com/eugenioenko/opentdf-sdk)
+are registered as one type per target: `gcgo`, `gcts`, `gcpy`, `gcjava`, `gccs`,
+`gcrs`, `gcc` and `gcswift`. They install from source only
+(`otdf-sdk-mgr install tip [--ref <ref>] gcgo`, or `checkout gcgo <ref>` plus
+`make` in `sdk/gcgo`); `sdk/gc.mk` pins and builds the Goalchemy compiler the
+checkout's `references.lock.json` names. Only `gcgo` builds today; the other
+types fail with "not built yet" until their native CLIs exist.
+
 ## Source Builds
 
 Source builds (`tip` mode) check out source to `sdk/{lang}/src/` and compile via `make` to `sdk/{lang}/dist/`. For Go, the platform monorepo is cloned to `sdk/go/platform-src/{ref}/` and `sdk/go/src/{ref}` is a symlink to its `otdfctl/` subdirectory; `make` discovers the platform's top-level `go.work` automatically so `protocol/go`, `sdk`, and `lib/*` resolve to the local checkout.

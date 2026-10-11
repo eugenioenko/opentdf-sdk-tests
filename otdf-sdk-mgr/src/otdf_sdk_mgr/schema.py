@@ -35,7 +35,9 @@ API_VERSION = "opentdf.io/v1alpha1"
 #         hybrid_tdf_enabled: true  # Enable ML-KEM in addition to auto-enabled features
 
 KasMode = Literal["standard", "key_management"]
-SdkName = Literal["go", "java", "js"]
+SdkName = Literal[
+    "go", "java", "js", "gcgo", "gcts", "gcpy", "gcjava", "gccs", "gcrs", "gcc", "gcswift"
+]
 ContainerKind = Literal["ztdf", "ztdf-ecwrap"]
 
 
