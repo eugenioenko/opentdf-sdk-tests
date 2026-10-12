@@ -2,12 +2,13 @@
 # including Makefile sets MAKEFILE_DIR, GC_TYPE (the xtest SDK type) and
 # GC_TARGET (the Goalchemy target name). Each src/<version> is a checkout or
 # symlink of https://github.com/eugenioenko/opentdf-sdk; the build pins the
-# Goalchemy release from its references.lock.json, builds that compiler, runs
+# Goalchemy revision from its references.lock.json (a release tag's commit,
+# or a fix commit pinned ahead of its release), builds that compiler, runs
 # the SDK's scripts/build-generated-<target>.sh and the target's CLI build,
 # and installs dist/<version>/{otdfgc,cli.sh}.
 
 # Targets whose native CLI build exists; the others fail with a clear message.
-GC_BUILT_TARGETS := go
+GC_BUILT_TARGETS := go typescript python
 GOALCHEMY_GIT ?= https://github.com/eugenioenko/goalchemy.git
 GC_BUILD_DIR := $(MAKEFILE_DIR)/build
 GC_GOALCHEMY_DIR := $(MAKEFILE_DIR)/../goalchemy
@@ -36,14 +37,15 @@ build:
 		lock="$$src_real/references.lock.json"; \
 		release=$$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repositories"]["goalchemy"]["release"])' "$$lock") || exit 1; \
 		revision=$$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["repositories"]["goalchemy"]["revision"])' "$$lock") || exit 1; \
-		gcdir="$(GC_GOALCHEMY_DIR)/$$release"; \
+		gcdir="$(GC_GOALCHEMY_DIR)/$$revision"; \
 		if [ -d "$$src_real/../goalchemy" ] && [ "$$(git -C "$$src_real/../goalchemy" rev-parse HEAD 2>/dev/null)" = "$$revision" ]; then \
 			gcdir="$$(cd "$$src_real/../goalchemy" && pwd -P)"; \
 		elif [ ! -d "$$gcdir" ]; then \
-			echo "  Cloning Goalchemy $$release"; \
-			git clone --quiet --depth 1 --branch "$$release" "$(GOALCHEMY_GIT)" "$$gcdir" || exit 1; \
+			echo "  Cloning Goalchemy $$release at $$revision"; \
+			git clone --quiet --no-checkout "$(GOALCHEMY_GIT)" "$$gcdir" || exit 1; \
+			git -C "$$gcdir" checkout --quiet "$$revision" || exit 1; \
 		fi; \
-		compiler="$(GC_BUILD_DIR)/goalchemy-$$release/goalchemy"; \
+		compiler="$(GC_BUILD_DIR)/goalchemy-$$revision/goalchemy"; \
 		if [ ! -x "$$compiler" ]; then \
 			echo "  Building Goalchemy $$release from $$gcdir"; \
 			mkdir -p "$$(dirname "$$compiler")"; \
