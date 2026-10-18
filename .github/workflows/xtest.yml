@@ -836,7 +836,7 @@ jobs:
           echo "platform_tag=${PLATFORM_TAG//\//-}" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         id: upload-artifact
         if: success() || failure()
         with:
@@ -844,7 +844,7 @@ jobs:
           path: otdftests/xtest/test-results/**/*.html
 
       - name: Upload audit logs on failure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: audit-logs-${{ steps.artifact-name.outputs.sdk_version }}-${{ steps.artifact-name.outputs.platform_tag }}
@@ -852,7 +852,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Upload server logs on failure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: server-logs-${{ steps.artifact-name.outputs.sdk_version }}-${{ steps.artifact-name.outputs.platform_tag }}
@@ -1101,7 +1101,7 @@ jobs:
       # surprising result offline beats re-running a 30-minute job to look at
       # the same numbers again.
       - name: Upload benchmark results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: success() || failure()
         with:
           name: ${{ job.status == 'success' && '✅' || '❌' }} bench-${{ matrix.sdk }}
@@ -1111,7 +1111,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload server logs on failure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: bench-server-logs-${{ matrix.sdk }}
@@ -1465,7 +1465,7 @@ jobs:
           PY
 
       - name: Upload ZIP64 results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: success() || failure()
         with:
           name: ${{ job.status == 'success' && '✅' || '❌' }} zip64-${{ matrix.sdk }}
@@ -1475,7 +1475,7 @@ jobs:
           if-no-files-found: warn
 
       - name: Upload server logs on failure
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: failure()
         with:
           name: zip64-server-logs-${{ matrix.sdk }}
